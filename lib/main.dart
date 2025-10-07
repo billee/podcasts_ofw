@@ -25,10 +25,11 @@ class DailyPodcastScreen extends StatefulWidget {
 }
 
 class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
-  final AudioPlayer _audioPlayer = AudioPlayer();
+  AudioPlayer _audioPlayer = AudioPlayer();
   PlayerState _playerState = PlayerState.stopped;
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
+  bool _isSeeking = false;
 
   // Podcast data - different podcast for each day
   final List<Map<String, String>> _podcasts = [
@@ -36,14 +37,15 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
       'title': 'Morning Motivation',
       'description':
           'Start your day with positive energy and inspiration. This podcast will help you set the right tone for a productive day ahead with actionable tips and motivational stories.',
-      'audioPath': 'audio/morning_motivation.mp3',
+      'audioPath':
+          'audio/E1_Hindi_Lang_Padala_Ang_Mas_Malalim_na_Pagkilala_sa_OFW.m4a',
       'duration': '15:30',
     },
     {
       'title': 'Tech News Daily',
       'description':
           'Stay updated with the latest in technology, from AI breakthroughs to new gadget releases. Perfect for tech enthusiasts and professionals.',
-      'audioPath': 'audio/tech_news.mp3',
+      'audioPath': 'audio/E2_Mindfulness_Minute_Para_sa_OFW.m4a',
       'duration': '12:45',
     },
     {
@@ -57,29 +59,16 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
       'title': 'Business Insights',
       'description':
           'Learn from successful entrepreneurs and business leaders. Get practical advice for growing your career or business.',
-      'audioPath': 'audio/business.mp3',
+      'audioPath': 'audio/E3_PD_442_Ang_Pundasyon_ng_OFW_Phenomenon.m4a',
       'duration': '18:20',
     },
     {
       'title': 'Health & Wellness',
       'description':
           'Evidence-based health tips and wellness strategies to help you live your best life.',
-      'audioPath': 'audio/health.mp3',
+      'audioPath':
+          'audio/E4_Ultimate_Gabay_OFW_Karapatan_sa_Kontrata,_Financial_Literacy.m4a',
       'duration': '14:50',
-    },
-    {
-      'title': 'Creative Writing',
-      'description':
-          'Spark your creativity with writing prompts and techniques from published authors.',
-      'audioPath': 'audio/writing.mp3',
-      'duration': '22:10',
-    },
-    {
-      'title': 'Weekend Reflection',
-      'description':
-          'A thoughtful podcast to help you reflect on the week and prepare for the days ahead.',
-      'audioPath': 'audio/weekend.mp3',
-      'duration': '16:40',
     },
   ];
 
@@ -98,9 +87,11 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
 
   void _setupAudioPlayer() {
     _audioPlayer.onPlayerStateChanged.listen((state) {
-      setState(() {
-        _playerState = state;
-      });
+      if (!_isSeeking) {
+        setState(() {
+          _playerState = state;
+        });
+      }
     });
 
     _audioPlayer.onDurationChanged.listen((duration) {
@@ -110,12 +101,15 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     });
 
     _audioPlayer.onPositionChanged.listen((position) {
-      setState(() {
-        _position = position;
-      });
+      if (!_isSeeking) {
+        setState(() {
+          _position = position;
+        });
+      }
     });
 
     _audioPlayer.onPlayerComplete.listen((event) {
+      // When audio completes, reset everything
       setState(() {
         _playerState = PlayerState.stopped;
         _position = Duration.zero;
@@ -127,43 +121,67 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     try {
       if (_playerState == PlayerState.playing) {
         await _audioPlayer.pause();
+      } else if (_playerState == PlayerState.paused) {
+        await _audioPlayer.resume();
       } else {
-        if (_playerState == PlayerState.stopped) {
-          await _audioPlayer.play(AssetSource(_todayPodcast['audioPath']!));
-        } else {
-          await _audioPlayer.resume();
-        }
+        // For stopped or completed state, play from beginning
+        await _audioPlayer.play(AssetSource(_todayPodcast['audioPath']!));
       }
     } catch (e) {
       print('Error playing audio: $e');
-      // For demo purposes, we'll just continue since we don't have actual audio files yet
+      // Show a user-friendly error message
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Unable to play audio. Please try again.'),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 2),
+        ),
+      );
+      // Reset state
       setState(() {
-        _playerState = PlayerState.playing;
-        _duration = Duration(minutes: 15, seconds: 30);
+        _playerState = PlayerState.stopped;
+        _position = Duration.zero;
       });
     }
   }
 
   Future<void> _stop() async {
-    await _audioPlayer.stop();
+    try {
+      await _audioPlayer.stop();
+    } catch (e) {
+      print('Error stopping audio: $e');
+    }
+    // Reset everything
     setState(() {
+      _playerState = PlayerState.stopped;
       _position = Duration.zero;
     });
   }
 
-  Future<void> _seek(Duration position) async {
-    await _audioPlayer.seek(position);
+  Future<void> _seek(double value) async {
+    if (_duration.inSeconds == 0) return;
+
+    final newPosition = _duration * value;
+    setState(() {
+      _isSeeking = true;
+      _position = newPosition;
+    });
+
+    try {
+      await _audioPlayer.seek(newPosition);
+    } catch (e) {
+      print('Error seeking: $e');
+    }
+
+    setState(() {
+      _isSeeking = false;
+    });
   }
 
   String _formatDuration(Duration duration) {
     String twoDigits(int n) => n.toString().padLeft(2, '0');
-    final hours = duration.inHours;
     final minutes = duration.inMinutes.remainder(60);
     final seconds = duration.inSeconds.remainder(60);
-
-    if (hours > 0) {
-      return '$hours:${twoDigits(minutes)}:${twoDigits(seconds)}';
-    }
     return '${twoDigits(minutes)}:${twoDigits(seconds)}';
   }
 
@@ -257,11 +275,6 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
 
                   // Audio Player
                   _buildAudioPlayer(),
-
-                  SizedBox(height: 24),
-
-                  // Info Card
-                  _buildInfoCard(),
                 ],
               ),
             ),
@@ -298,11 +311,8 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
           children: [
             // Progress bar
             Slider(
-              value: progress,
-              onChanged: (value) {
-                final newPosition = _duration * value;
-                _seek(newPosition);
-              },
+              value: progress.isNaN ? 0.0 : progress,
+              onChanged: _seek,
               activeColor: Colors.blue,
               inactiveColor: Colors.grey[300],
             ),
@@ -391,51 +401,6 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
                 color: _getStatusColor(),
                 fontWeight: FontWeight.w600,
                 fontSize: 14,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _buildInfoCard() {
-    return Card(
-      elevation: 2,
-      child: Padding(
-        padding: const EdgeInsets.all(16.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Icon(Icons.info_outline, color: Colors.blue),
-                SizedBox(width: 8),
-                Text(
-                  'How This Works',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ],
-            ),
-            SizedBox(height: 12),
-            Text(
-              'This app features a different podcast every day. '
-              'Each day of the month cycles through our collection of podcasts. '
-              'Come back tomorrow for a brand new episode!',
-              style: TextStyle(
-                color: Colors.grey[700],
-                height: 1.5,
-              ),
-            ),
-            SizedBox(height: 8),
-            Text(
-              'Total podcasts in collection: ${_podcasts.length}',
-              style: TextStyle(
-                color: Colors.grey[600],
-                fontWeight: FontWeight.w500,
               ),
             ),
           ],
