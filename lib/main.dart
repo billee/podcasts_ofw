@@ -1,20 +1,46 @@
 import 'package:flutter/material.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:provider/provider.dart';
+import 'package:firebase_core/firebase_core.dart';
 
-void main() {
+import 'core/auth/auth_service.dart';
+import 'admin/screens/admin_login_screen.dart';
+import 'admin/screens/admin_dashboard.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize Firebase with error handling
+  try {
+    await Firebase.initializeApp();
+    print('Firebase initialized successfully');
+  } catch (e) {
+    print('Firebase initialization error: $e');
+  }
+
   runApp(MyApp());
 }
 
 class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Daily Podcast',
-      theme: ThemeData(
-        primarySwatch: Colors.blue,
+    return MultiProvider(
+      providers: [
+        ChangeNotifierProvider(create: (_) => AuthService()),
+      ],
+      child: MaterialApp(
+        title: 'Daily Podcast',
+        theme: ThemeData(
+          primarySwatch: Colors.blue,
+        ),
+        initialRoute: '/',
+        routes: {
+          '/': (context) => DailyPodcastScreen(),
+          '/admin/login': (context) => AdminLoginScreen(),
+          '/admin/dashboard': (context) => AdminDashboard(),
+        },
+        debugShowCheckedModeBanner: false,
       ),
-      home: DailyPodcastScreen(),
-      debugShowCheckedModeBanner: false,
     );
   }
 }
@@ -30,6 +56,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
   bool _isSeeking = false;
+  int _tapCount = 0;
 
   // Podcast data - different podcast for each day
   final List<Map<String, String>> _podcasts = [
@@ -77,6 +104,10 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     final today = DateTime.now();
     final index = (today.day - 1) % _podcasts.length;
     return _podcasts[index];
+  }
+
+  void _navigateToAdmin() {
+    Navigator.pushNamed(context, '/admin/login');
   }
 
   @override
@@ -202,36 +233,49 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
           SliverAppBar(
             expandedHeight: 250.0,
             flexibleSpace: FlexibleSpaceBar(
-              background: Container(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [Colors.blue[800]!, Colors.purple[700]!],
+              background: GestureDetector(
+                onTap: () {
+                  // Triple tap to open admin
+                  _tapCount++;
+                  if (_tapCount >= 3) {
+                    _tapCount = 0;
+                    _navigateToAdmin();
+                  }
+                  Future.delayed(const Duration(seconds: 2), () {
+                    _tapCount = 0;
+                  });
+                },
+                child: Container(
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [Colors.blue[800]!, Colors.purple[700]!],
+                    ),
                   ),
-                ),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.headphones, size: 70, color: Colors.white),
-                    SizedBox(height: 16),
-                    Text(
-                      "Today's Podcast",
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 28,
-                        fontWeight: FontWeight.bold,
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.headphones, size: 70, color: Colors.white),
+                      SizedBox(height: 16),
+                      Text(
+                        "Today's Podcast",
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 28,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
-                    ),
-                    SizedBox(height: 8),
-                    Text(
-                      _getFormattedDate(),
-                      style: TextStyle(
-                        color: Colors.white70,
-                        fontSize: 16,
+                      SizedBox(height: 8),
+                      Text(
+                        _getFormattedDate(),
+                        style: TextStyle(
+                          color: Colors.white70,
+                          fontSize: 16,
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
               ),
             ),
