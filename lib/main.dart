@@ -2,12 +2,17 @@ import 'package:flutter/material.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_core/firebase_core.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   // Load environment variables
   await dotenv.load(fileName: '.env');
+
+  // Initialize Firebase
+  await Firebase.initializeApp();
 
   // Initialize Supabase (for storage only)
   await Supabase.initialize(
@@ -43,30 +48,22 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
   Duration _duration = Duration.zero;
   Duration _position = Duration.zero;
   bool _isSeeking = false;
+  List<Map<String, dynamic>> _podcasts = [];
+  bool _isLoading = true;
 
   // Get Supabase URL from environment variables
   String get _supabaseUrl => dotenv.env['SUPABASE_URL']!;
 
-  // Podcast data - using hardcoded data for now
-  final List<Map<String, dynamic>> _podcasts = [
-    {
-      'title': 'Morning Motivation',
-      'description':
-          'Start your day with positive energy and inspiration. This podcast will help you set the right tone for a productive day ahead with actionable tips and motivational stories.',
-      'audioFileName': 'podcast_1759978000157_ang_kakaiba.mp3',
-      'duration': '15:30',
-    },
-    {
-      'title': 'Mindfulness Minute',
-      'description':
-          'Take a moment to center yourself and find peace in the present moment.',
-      'audioFileName': 'podcast_1760027156921_mindfulness.mp3',
-      'duration': '10:15',
-    },
-  ];
-
   // Get today's podcast based on the day of the month
   Map<String, dynamic> get _todayPodcast {
+    if (_podcasts.isEmpty) {
+      return {
+        'title': 'No Podcast Available',
+        'description': 'Please check back later for new podcasts.',
+        'audioFileName': '',
+        'duration': '0:00',
+      };
+    }
     final today = DateTime.now();
     final index = (today.day - 1) % _podcasts.length;
     return _podcasts[index];
@@ -81,6 +78,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
   void initState() {
     super.initState();
     _setupAudioPlayer();
+    _fetchPodcasts();
   }
 
   void _setupAudioPlayer() {
@@ -112,6 +110,40 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
         _position = Duration.zero;
       });
     });
+  }
+
+  Future<void> _fetchPodcasts() async {
+    try {
+      final querySnapshot = await FirebaseFirestore.instance
+          .collection('podcasts')
+          .where('isActive', isEqualTo: true)
+          .orderBy('createdAt', descending: true)
+          .get();
+
+      setState(() {
+        _podcasts = querySnapshot.docs.map((doc) {
+          final data = doc.data();
+          return {
+            'title': data['title'] ?? 'Untitled',
+            'description': data['description'] ?? 'No description available.',
+            'audioFileName': data['audioFileName'] ?? '',
+            'duration': data['duration'] ?? '0:00',
+          };
+        }).toList();
+        _isLoading = false;
+      });
+    } catch (e) {
+      print('Error fetching podcasts: $e');
+      setState(() {
+        _isLoading = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to load podcasts. Please try again.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
   }
 
   Future<void> _playPause() async {
@@ -199,6 +231,25 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isLoading) {
+      return Scaffold(
+        backgroundColor: Colors.grey[50],
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 20),
+              Text(
+                'Loading podcasts...',
+                style: TextStyle(fontSize: 16, color: Colors.grey[600]),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     final podcast = _todayPodcast;
 
     return Scaffold(
