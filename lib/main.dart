@@ -1,7 +1,20 @@
 import 'package:flutter/material.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Load environment variables
+  await dotenv.load(fileName: '.env');
+
+  // Initialize Supabase (for storage only)
+  await Supabase.initialize(
+    url: dotenv.env['SUPABASE_URL']!,
+    anonKey: dotenv.env['SUPABASE_ANON_KEY']!,
+  );
+
   runApp(MyApp());
 }
 
@@ -31,52 +44,37 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
   Duration _position = Duration.zero;
   bool _isSeeking = false;
 
-  // Podcast data - different podcast for each day
-  final List<Map<String, String>> _podcasts = [
+  // Get Supabase URL from environment variables
+  String get _supabaseUrl => dotenv.env['SUPABASE_URL']!;
+
+  // Podcast data - using hardcoded data for now
+  final List<Map<String, dynamic>> _podcasts = [
     {
       'title': 'Morning Motivation',
       'description':
           'Start your day with positive energy and inspiration. This podcast will help you set the right tone for a productive day ahead with actionable tips and motivational stories.',
-      'audioPath':
-          'audio/E1_Hindi_Lang_Padala_Ang_Mas_Malalim_na_Pagkilala_sa_OFW.m4a',
+      'audioFileName': 'podcast_1759978000157_ang_kakaiba.mp3',
       'duration': '15:30',
     },
     {
-      'title': 'Tech News Daily',
+      'title': 'Mindfulness Minute',
       'description':
-          'Stay updated with the latest in technology, from AI breakthroughs to new gadget releases. Perfect for tech enthusiasts and professionals.',
-      'audioPath': 'audio/E2_Mindfulness_Minute_Para_sa_OFW.m4a',
-      'duration': '12:45',
-    },
-    {
-      'title': 'Mindfulness Meditation',
-      'description':
-          'Take a break and center yourself with this guided meditation session. Reduce stress and improve focus in just 20 minutes.',
-      'audioPath': 'audio/E2_Mindfulness_Minute_Para_sa_OFW.m4a',
-      'duration': '20:15',
-    },
-    {
-      'title': 'Business Insights',
-      'description':
-          'Learn from successful entrepreneurs and business leaders. Get practical advice for growing your career or business.',
-      'audioPath': 'audio/E3_PD_442_Ang_Pundasyon_ng_OFW_Phenomenon.m4a',
-      'duration': '18:20',
-    },
-    {
-      'title': 'Health & Wellness',
-      'description':
-          'Evidence-based health tips and wellness strategies to help you live your best life.',
-      'audioPath':
-          'audio/E4_Ultimate_Gabay_OFW_Karapatan_sa_Kontrata,_Financial_Literacy.m4a',
-      'duration': '14:50',
+          'Take a moment to center yourself and find peace in the present moment.',
+      'audioFileName': 'podcast_1760027156921_mindfulness.mp3',
+      'duration': '10:15',
     },
   ];
 
   // Get today's podcast based on the day of the month
-  Map<String, String> get _todayPodcast {
+  Map<String, dynamic> get _todayPodcast {
     final today = DateTime.now();
     final index = (today.day - 1) % _podcasts.length;
     return _podcasts[index];
+  }
+
+  // Get the public URL for a podcast file from Supabase storage
+  String _getAudioUrl(String audioFileName) {
+    return '$_supabaseUrl/storage/v1/object/public/podcasts/$audioFileName';
   }
 
   @override
@@ -109,7 +107,6 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     });
 
     _audioPlayer.onPlayerComplete.listen((event) {
-      // When audio completes, reset everything
       setState(() {
         _playerState = PlayerState.stopped;
         _position = Duration.zero;
@@ -124,20 +121,30 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
       } else if (_playerState == PlayerState.paused) {
         await _audioPlayer.resume();
       } else {
-        // For stopped or completed state, play from beginning
-        await _audioPlayer.play(AssetSource(_todayPodcast['audioPath']!));
+        final podcast = _todayPodcast;
+        final audioFileName = podcast['audioFileName']?.toString() ?? '';
+
+        if (audioFileName.isEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Audio file not available.'),
+              backgroundColor: Colors.red,
+            ),
+          );
+          return;
+        }
+
+        final audioUrl = _getAudioUrl(audioFileName);
+        await _audioPlayer.play(UrlSource(audioUrl));
       }
     } catch (e) {
       print('Error playing audio: $e');
-      // Show a user-friendly error message
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('Unable to play audio. Please try again.'),
           backgroundColor: Colors.red,
-          duration: Duration(seconds: 2),
         ),
       );
-      // Reset state
       setState(() {
         _playerState = PlayerState.stopped;
         _position = Duration.zero;
@@ -151,7 +158,6 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     } catch (e) {
       print('Error stopping audio: $e');
     }
-    // Reset everything
     setState(() {
       _playerState = PlayerState.stopped;
       _position = Duration.zero;
@@ -243,7 +249,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    podcast['title']!,
+                    podcast['title']?.toString() ?? 'No Title',
                     style: TextStyle(
                       fontSize: 28,
                       fontWeight: FontWeight.bold,
@@ -251,20 +257,18 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
                     ),
                   ),
                   SizedBox(height: 16),
-
-                  // Podcast metadata
                   Row(
                     children: [
-                      _buildMetadata(Icons.schedule, podcast['duration']!),
+                      _buildMetadata(Icons.schedule,
+                          podcast['duration']?.toString() ?? '0:00'),
                       SizedBox(width: 16),
                       _buildMetadata(Icons.calendar_today, _getFormattedDate()),
                     ],
                   ),
                   SizedBox(height: 24),
-
-                  // Description
                   Text(
-                    podcast['description']!,
+                    podcast['description']?.toString() ??
+                        'No description available.',
                     style: TextStyle(
                       fontSize: 16,
                       height: 1.6,
@@ -272,8 +276,6 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
                     ),
                   ),
                   SizedBox(height: 32),
-
-                  // Audio Player
                   _buildAudioPlayer(),
                 ],
               ),
@@ -309,15 +311,12 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
         padding: const EdgeInsets.all(24.0),
         child: Column(
           children: [
-            // Progress bar
             Slider(
               value: progress.isNaN ? 0.0 : progress,
               onChanged: _seek,
               activeColor: Colors.blue,
               inactiveColor: Colors.grey[300],
             ),
-
-            // Time labels
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 4.0),
               child: Row(
@@ -334,24 +333,17 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
                 ],
               ),
             ),
-
             SizedBox(height: 24),
-
-            // Control buttons
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                // Stop button
                 IconButton(
                   icon: Icon(Icons.stop, size: 28),
                   onPressed: _stop,
                   color: Colors.red,
                   tooltip: 'Stop',
                 ),
-
                 SizedBox(width: 16),
-
-                // Play/Pause button
                 Container(
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
@@ -379,10 +371,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
                         _playerState == PlayerState.playing ? 'Pause' : 'Play',
                   ),
                 ),
-
                 SizedBox(width: 16),
-
-                // Restart button
                 IconButton(
                   icon: Icon(Icons.replay, size: 28),
                   onPressed: _stop,
@@ -391,10 +380,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
                 ),
               ],
             ),
-
             SizedBox(height: 16),
-
-            // Status
             Text(
               _getPlayerStatus(),
               style: TextStyle(

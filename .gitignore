@@ -50,3 +50,5 @@ ios/
 linux/
 macos/
 windows/
+
+.env
