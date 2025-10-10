@@ -51,7 +51,12 @@ class MyApp extends StatelessWidget {
   }
 }
 
-class AppAccessWrapper extends StatelessWidget {
+class AppAccessWrapper extends StatefulWidget {
+  @override
+  _AppAccessWrapperState createState() => _AppAccessWrapperState();
+}
+
+class _AppAccessWrapperState extends State<AppAccessWrapper> {
   @override
   Widget build(BuildContext context) {
     final purchaseService = Provider.of<AppPurchaseService>(context);
@@ -79,6 +84,9 @@ class AppAccessWrapper extends StatelessWidget {
         }
 
         final accessState = snapshot.data ?? AppAccessState.trialExpired;
+
+        // Print for debugging
+        print('Current access state: $accessState');
 
         switch (accessState) {
           case AppAccessState.hasAccess:
@@ -384,9 +392,16 @@ class AppPurchaseService with ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     final eightDaysAgo = DateTime.now().subtract(Duration(days: 8));
     await prefs.setString(_trialStartKey, eightDaysAgo.toIso8601String());
+    await prefs.setBool(_purchasedKey, false); // Ensure not purchased
     await _calculateTrialDays();
+
+    print('DEBUG: Trial set to EXPIRED');
     await debugPrintSharedPreferences();
+
     notifyListeners();
+
+    // Force navigation by using a global key or similar approach
+    // This will be handled by the AppAccessWrapper rebuilding
   }
 
   Future<void> debugResetTrial() async {
@@ -394,7 +409,10 @@ class AppPurchaseService with ChangeNotifier {
     await prefs.setString(_trialStartKey, DateTime.now().toIso8601String());
     await prefs.setBool(_purchasedKey, false);
     await _calculateTrialDays();
+
+    print('DEBUG: Trial reset to DAY 1');
     await debugPrintSharedPreferences();
+
     notifyListeners();
   }
 
@@ -426,43 +444,48 @@ class SubscriptionScreen extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.all(24.0),
           child: Column(
-            crossAxisAlignment: CrossAxisAlignment.center,
             children: [
-              Expanded(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(
-                      Icons.workspace_premium,
-                      size: 80,
-                      color: Colors.blue,
-                    ),
-                    SizedBox(height: 24),
-                    Text(
-                      'Unlock Full Access',
-                      style: TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.bold,
-                        color: Colors.black87,
-                      ),
-                    ),
-                    SizedBox(height: 16),
-                    Text(
-                      'Your 7-day free trial has ended. Subscribe now to continue enjoying daily podcasts without interruption.',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 16,
-                        height: 1.6,
-                        color: Colors.black87,
-                      ),
-                    ),
-                    SizedBox(height: 32),
-                    _buildFeatureList(),
-                    SizedBox(height: 32),
-                    _buildPricingCard(),
-                  ],
+              // Header section
+              Icon(
+                Icons.workspace_premium,
+                size: 80,
+                color: Colors.blue,
+              ),
+              SizedBox(height: 16),
+              Text(
+                'Unlock Full Access',
+                style: TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.black87,
                 ),
               ),
+              SizedBox(height: 12),
+              Text(
+                'Your 7-day free trial has ended. Subscribe now to continue enjoying daily podcasts.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 16,
+                  height: 1.5,
+                  color: Colors.black87,
+                ),
+              ),
+              SizedBox(height: 24),
+
+              // Scrollable content
+              Expanded(
+                child: SingleChildScrollView(
+                  child: Column(
+                    children: [
+                      _buildFeatureList(),
+                      SizedBox(height: 24),
+                      _buildPricingCard(),
+                    ],
+                  ),
+                ),
+              ),
+
+              // Fixed buttons at bottom
               Container(
                 width: double.infinity,
                 child: ElevatedButton(
@@ -481,7 +504,7 @@ class SubscriptionScreen extends StatelessWidget {
                   ),
                 ),
               ),
-              SizedBox(height: 16),
+              SizedBox(height: 12),
               TextButton(
                 onPressed: () => purchaseService.restorePurchases(),
                 child: Text(
@@ -489,10 +512,17 @@ class SubscriptionScreen extends StatelessWidget {
                   style: TextStyle(color: Colors.blue),
                 ),
               ),
-              // Debug buttons - remove in production
-              SizedBox(height: 8),
+              // Debug button
               TextButton(
-                onPressed: () => purchaseService.debugResetTrial(),
+                onPressed: () {
+                  purchaseService.debugResetTrial();
+                  // Force rebuild by using a hack - navigate away and back
+                  Navigator.pushAndRemoveUntil(
+                    context,
+                    MaterialPageRoute(builder: (context) => MyApp()),
+                    (route) => false,
+                  );
+                },
                 child: Text(
                   'DEBUG: Reset Trial',
                   style: TextStyle(color: Colors.grey, fontSize: 12),
@@ -518,7 +548,7 @@ class SubscriptionScreen extends StatelessWidget {
     return Column(
       children: features
           .map((feature) => Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8.0),
+                padding: const EdgeInsets.symmetric(vertical: 6.0),
                 child: Row(
                   children: [
                     Icon(Icons.check_circle, color: Colors.green, size: 20),
@@ -741,6 +771,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
 
   void _setupAudioPlayer() {
     _audioPlayer.onPlayerStateChanged.listen((state) {
+      if (!mounted) return; // Prevent setState if widget is disposed
       if (!_isSeeking) {
         setState(() {
           _playerState = state;
@@ -749,12 +780,14 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     });
 
     _audioPlayer.onDurationChanged.listen((duration) {
+      if (!mounted) return; // Prevent setState if widget is disposed
       setState(() {
         _duration = duration;
       });
     });
 
     _audioPlayer.onPositionChanged.listen((position) {
+      if (!mounted) return; // Prevent setState if widget is disposed
       if (!_isSeeking) {
         setState(() {
           _position = position;
@@ -763,6 +796,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     });
 
     _audioPlayer.onPlayerComplete.listen((event) {
+      if (!mounted) return; // Prevent setState if widget is disposed
       setState(() {
         _playerState = PlayerState.stopped;
         _position = Duration.zero;
@@ -939,6 +973,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
   @override
   void dispose() {
     _audioPlayer.dispose();
+    // Also cancel any other subscriptions if you have them
     super.dispose();
   }
 
@@ -1008,7 +1043,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
             ),
             actions: [
               IconButton(
-                icon: Icon(Icons.settings),
+                icon: Icon(Icons.settings, color: Colors.white),
                 onPressed: () {
                   Navigator.push(
                       context,
@@ -1058,6 +1093,14 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
             ),
           ),
         ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () {
+          Navigator.push(context,
+              MaterialPageRoute(builder: (context) => SettingsScreen()));
+        },
+        child: Icon(Icons.settings),
+        backgroundColor: Colors.blue,
       ),
     );
   }
