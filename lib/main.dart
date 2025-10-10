@@ -161,10 +161,24 @@ class AppPurchaseService with ChangeNotifier {
       final trialEnd = trialStart.add(Duration(days: 7));
       final now = DateTime.now();
 
-      daysRemaining = trialEnd.difference(now).inDays;
+      // Calculate the difference in days
+      final difference = trialEnd.difference(now);
+      daysRemaining = difference.inDays;
+
+      // If we're on the same day but trial hasn't ended, show 1 day remaining
+      if (difference.inHours > 0 && difference.inDays == 0) {
+        daysRemaining = 1; // Show 1 day remaining on the last day
+      }
+
       if (daysRemaining < 0) daysRemaining = 0;
 
-      print('Trial days remaining: $daysRemaining');
+      print('Trial calculation:');
+      print('- Trial start: $trialStart');
+      print('- Trial end: $trialEnd');
+      print('- Now: $now');
+      print(
+          '- Difference: ${difference.inDays} days, ${difference.inHours.remainder(24)} hours');
+      print('- Days remaining: $daysRemaining');
     }
   }
 
@@ -381,18 +395,34 @@ class AppPurchaseService with ChangeNotifier {
 
   Future<void> debugSetTrialToLastDay() async {
     final prefs = await SharedPreferences.getInstance();
+
+    // Set trial start to 6 days ago (so today is the 7th/last day)
+    // This should give 1 day remaining, not 0
     final sixDaysAgo = DateTime.now().subtract(Duration(days: 6));
     await prefs.setString(_trialStartKey, sixDaysAgo.toIso8601String());
+    await prefs.setBool(_purchasedKey, false); // Ensure not purchased
+
+    // Force recalculate days
     await _calculateTrialDays();
+
+    print('DEBUG: Trial set to LAST DAY (should show 1 day remaining)');
+    print('DEBUG: Actual days remaining: $daysRemaining');
     await debugPrintSharedPreferences();
+
     notifyListeners();
+
+    // Force navigation
+    _forceAppRefresh();
   }
 
   Future<void> debugSetTrialExpired() async {
     final prefs = await SharedPreferences.getInstance();
+
+    // Set trial start to 8 days ago (trial expired)
     final eightDaysAgo = DateTime.now().subtract(Duration(days: 8));
     await prefs.setString(_trialStartKey, eightDaysAgo.toIso8601String());
     await prefs.setBool(_purchasedKey, false); // Ensure not purchased
+
     await _calculateTrialDays();
 
     print('DEBUG: Trial set to EXPIRED');
@@ -400,24 +430,38 @@ class AppPurchaseService with ChangeNotifier {
 
     notifyListeners();
 
-    // Force navigation by using a global key or similar approach
-    // This will be handled by the AppAccessWrapper rebuilding
+    // Force navigation
+    _forceAppRefresh();
   }
 
   Future<void> debugResetTrial() async {
     final prefs = await SharedPreferences.getInstance();
+
+    // Set trial to today (fresh start)
     await prefs.setString(_trialStartKey, DateTime.now().toIso8601String());
-    await prefs.setBool(_purchasedKey, false);
+    await prefs.setBool(_purchasedKey, false); // Ensure not purchased
+
     await _calculateTrialDays();
 
-    print('DEBUG: Trial reset to DAY 1');
+    print('DEBUG: Trial reset to DAY 1 (7 days remaining)');
     await debugPrintSharedPreferences();
 
     notifyListeners();
+
+    // Force navigation
+    _forceAppRefresh();
   }
 
   Future<void> debugSimulatePurchase() async {
     await _activateSubscription();
+  }
+
+  void _forceAppRefresh() {
+    // This will trigger the AppAccessWrapper to rebuild
+    // We use a small delay to ensure the state is updated first
+    Future.delayed(Duration(milliseconds: 100), () {
+      notifyListeners();
+    });
   }
 
   @override
@@ -682,17 +726,41 @@ class SettingsScreen extends StatelessWidget {
           ListTile(
             leading: Icon(Icons.refresh),
             title: Text('Reset Trial to Day 1'),
-            onTap: () => purchaseService.debugResetTrial(),
+            onTap: () async {
+              await purchaseService.debugResetTrial();
+              // Force navigation back
+              Navigator.pushAndRemoveUntil(
+                context,
+                MaterialPageRoute(builder: (context) => MyApp()),
+                (route) => false,
+              );
+            },
           ),
           ListTile(
             leading: Icon(Icons.warning),
             title: Text('Set Trial to Last Day'),
-            onTap: () => purchaseService.debugSetTrialToLastDay(),
+            onTap: () async {
+              await purchaseService.debugSetTrialToLastDay();
+              // Force navigation back
+              Navigator.pushAndRemoveUntil(
+                context,
+                MaterialPageRoute(builder: (context) => MyApp()),
+                (route) => false,
+              );
+            },
           ),
           ListTile(
             leading: Icon(Icons.error),
             title: Text('Set Trial Expired'),
-            onTap: () => purchaseService.debugSetTrialExpired(),
+            onTap: () async {
+              await purchaseService.debugSetTrialExpired();
+              // Force navigation back
+              Navigator.pushAndRemoveUntil(
+                context,
+                MaterialPageRoute(builder: (context) => MyApp()),
+                (route) => false,
+              );
+            },
           ),
           ListTile(
             leading: Icon(Icons.sim_card),
