@@ -1,9 +1,13 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:in_app_purchase/in_app_purchase.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:provider/provider.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -12,7 +16,7 @@ void main() async {
   await dotenv.load(fileName: '.env');
 
   try {
-    // Initialize Firebase
+    // Initialize Firebase (for podcasts data only)
     await Firebase.initializeApp();
     print('Firebase initialized successfully');
   } catch (e) {
@@ -25,7 +29,12 @@ void main() async {
     anonKey: dotenv.env['SUPABASE_ANON_KEY']!,
   );
 
-  runApp(MyApp());
+  runApp(
+    ChangeNotifierProvider(
+      create: (context) => AppPurchaseService(),
+      child: MyApp(),
+    ),
+  );
 }
 
 class MyApp extends StatelessWidget {
@@ -36,13 +45,430 @@ class MyApp extends StatelessWidget {
       theme: ThemeData(
         primarySwatch: Colors.blue,
       ),
-      home: DailyPodcastScreen(),
+      home: AppAccessWrapper(),
       debugShowCheckedModeBanner: false,
     );
   }
 }
 
+class AppAccessWrapper extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final purchaseService = Provider.of<AppPurchaseService>(context);
+
+    return FutureBuilder<AppAccessState>(
+      future: purchaseService.getAccessState(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return Scaffold(
+            backgroundColor: Colors.grey[50],
+            body: Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 20),
+                  Text(
+                    'Checking access...',
+                    style: TextStyle(fontSize: 16, color: Colors.grey[600]),
+                  ),
+                ],
+              ),
+            ),
+          );
+        }
+
+        final accessState = snapshot.data ?? AppAccessState.trialExpired;
+
+        switch (accessState) {
+          case AppAccessState.hasAccess:
+            return DailyPodcastScreen();
+          case AppAccessState.inTrial:
+            return DailyPodcastScreen(
+              showTrialBanner: true,
+              daysRemaining: purchaseService.daysRemaining,
+            );
+          case AppAccessState.trialExpired:
+            return SubscriptionScreen();
+          default:
+            return SubscriptionScreen();
+        }
+      },
+    );
+  }
+}
+
+enum AppAccessState {
+  hasAccess, // User has purchased subscription
+  inTrial, // User is in trial period
+  trialExpired, // Trial expired, needs to purchase
+}
+
+class AppPurchaseService with ChangeNotifier {
+  final String _subscriptionProductId =
+      'podcast_subscription_monthly'; // Change to your actual product ID
+  final String _trialStartKey = 'trial_start_date';
+  final String _purchasedKey = 'has_purchased';
+
+  int daysRemaining = 0;
+  bool _isLoading = true;
+
+  // IAP related
+  late StreamSubscription<List<PurchaseDetails>> _subscription;
+  List<ProductDetails> _products = [];
+
+  AppPurchaseService() {
+    _initialize();
+  }
+
+  Future<void> _initialize() async {
+    // Initialize trial if needed
+    await _initializeTrial();
+
+    // Set up IAP listeners
+    _setupIAPListeners();
+
+    _isLoading = false;
+    notifyListeners();
+  }
+
+  Future<void> _initializeTrial() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    // Check if trial already started
+    if (!prefs.containsKey(_trialStartKey)) {
+      // First launch - start trial
+      await prefs.setString(_trialStartKey, DateTime.now().toIso8601String());
+      print('Trial started: ${DateTime.now()}');
+    }
+
+    // Calculate days remaining
+    await _calculateTrialDays();
+  }
+
+  Future<void> _calculateTrialDays() async {
+    final prefs = await SharedPreferences.getInstance();
+    final trialStartString = prefs.getString(_trialStartKey);
+
+    if (trialStartString != null) {
+      final trialStart = DateTime.parse(trialStartString);
+      final trialEnd = trialStart.add(Duration(days: 7));
+      final now = DateTime.now();
+
+      daysRemaining = trialEnd.difference(now).inDays;
+      if (daysRemaining < 0) daysRemaining = 0;
+
+      print('Trial days remaining: $daysRemaining');
+    }
+  }
+
+  Future<void> _setupIAPListeners() async {
+    try {
+      // Check if IAP is available
+      final available = await InAppPurchase.instance.isAvailable();
+      if (!available) {
+        print('IAP not available on this device');
+        return;
+      }
+
+      final purchaseUpdated = InAppPurchase.instance.purchaseStream;
+      _subscription = purchaseUpdated.listen(
+        _onPurchaseUpdate,
+        onDone: () => _subscription.cancel(),
+        onError: (error) => print('IAP Error: $error'),
+      );
+    } catch (e) {
+      print('Error setting up IAP listeners: $e');
+    }
+  }
+
+  void _onPurchaseUpdate(List<PurchaseDetails> purchaseDetailsList) {
+    purchaseDetailsList.forEach(_handlePurchase);
+  }
+
+  Future<void> _handlePurchase(PurchaseDetails purchaseDetails) async {
+    if (purchaseDetails.status == PurchaseStatus.purchased ||
+        purchaseDetails.status == PurchaseStatus.restored) {
+      // Purchase successful - save purchase status
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_purchasedKey, true);
+
+      print('Purchase successful: ${purchaseDetails.productID}');
+
+      // Notify listeners to update UI
+      notifyListeners();
+
+      // IMPORTANT: Always complete the purchase
+      await InAppPurchase.instance.completePurchase(purchaseDetails);
+    }
+  }
+
+  Future<AppAccessState> getAccessState() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    // Check if user has purchased
+    final hasPurchased = prefs.getBool(_purchasedKey) ?? false;
+    if (hasPurchased) {
+      return AppAccessState.hasAccess;
+    }
+
+    // Check trial status
+    final trialStartString = prefs.getString(_trialStartKey);
+    if (trialStartString != null) {
+      final trialStart = DateTime.parse(trialStartString);
+      final trialEnd = trialStart.add(Duration(days: 7));
+      final now = DateTime.now();
+
+      if (now.isBefore(trialEnd)) {
+        await _calculateTrialDays();
+        return AppAccessState.inTrial;
+      }
+    }
+
+    return AppAccessState.trialExpired;
+  }
+
+  Future<void> purchaseSubscription() async {
+    try {
+      // Load products first
+      await _loadProducts();
+
+      if (_products.isEmpty) {
+        print('No products available');
+        ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+          SnackBar(
+            content: Text(
+                'Subscription not available at the moment. Please try again later.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+        return;
+      }
+
+      final purchaseParam = PurchaseParam(productDetails: _products.first);
+      await InAppPurchase.instance.buyConsumable(purchaseParam: purchaseParam);
+    } catch (e) {
+      print('Purchase error: $e');
+      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+        SnackBar(
+          content: Text('Error processing purchase. Please try again.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> _loadProducts() async {
+    try {
+      final ProductDetailsResponse response = await InAppPurchase.instance
+          .queryProductDetails({_subscriptionProductId});
+
+      if (response.notFoundIDs.isNotEmpty) {
+        print('Product not found: ${response.notFoundIDs}');
+      }
+
+      _products = response.productDetails;
+      print('Loaded products: ${_products.length}');
+    } catch (e) {
+      print('Error loading products: $e');
+    }
+  }
+
+  Future<void> restorePurchases() async {
+    try {
+      await InAppPurchase.instance.restorePurchases();
+      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+        SnackBar(
+          content: Text('Restoring purchases...'),
+          backgroundColor: Colors.blue,
+        ),
+      );
+    } catch (e) {
+      print('Restore purchases error: $e');
+      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+        SnackBar(
+          content: Text('Error restoring purchases. Please try again.'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _subscription.cancel();
+    super.dispose();
+  }
+}
+
+// Helper class to get context for snackbars
+class GlobalContext {
+  static late BuildContext context;
+}
+
+class SubscriptionScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    // Store context for snackbars
+    GlobalContext.context = context;
+
+    final purchaseService = Provider.of<AppPurchaseService>(context);
+
+    return Scaffold(
+      backgroundColor: Colors.grey[50],
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      Icons.workspace_premium,
+                      size: 80,
+                      color: Colors.blue,
+                    ),
+                    SizedBox(height: 24),
+                    Text(
+                      'Unlock Full Access',
+                      style: TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.black87,
+                      ),
+                    ),
+                    SizedBox(height: 16),
+                    Text(
+                      'Your 7-day free trial has ended. Subscribe now to continue enjoying daily podcasts without interruption.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 16,
+                        height: 1.6,
+                        color: Colors.black87,
+                      ),
+                    ),
+                    SizedBox(height: 32),
+                    _buildFeatureList(),
+                    SizedBox(height: 32),
+                    _buildPricingCard(),
+                  ],
+                ),
+              ),
+              Container(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () => purchaseService.purchaseSubscription(),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blue,
+                    foregroundColor: Colors.white,
+                    padding: EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  child: Text(
+                    'Subscribe Now',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+              SizedBox(height: 16),
+              TextButton(
+                onPressed: () => purchaseService.restorePurchases(),
+                child: Text(
+                  'Restore Purchase',
+                  style: TextStyle(color: Colors.blue),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildFeatureList() {
+    final features = [
+      'Daily podcast episodes',
+      'High-quality audio',
+      'Offline listening',
+      'No advertisements',
+      'Exclusive content',
+    ];
+
+    return Column(
+      children: features
+          .map((feature) => Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8.0),
+                child: Row(
+                  children: [
+                    Icon(Icons.check_circle, color: Colors.green, size: 20),
+                    SizedBox(width: 12),
+                    Text(
+                      feature,
+                      style: TextStyle(fontSize: 16),
+                    ),
+                  ],
+                ),
+              ))
+          .toList(),
+    );
+  }
+
+  Widget _buildPricingCard() {
+    return Card(
+      elevation: 4,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            Text(
+              'Monthly Subscription',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: Colors.black87,
+              ),
+            ),
+            SizedBox(height: 8),
+            Text(
+              '\$4.99 / month', // This will be dynamic from IAP
+              style: TextStyle(
+                fontSize: 24,
+                fontWeight: FontWeight.bold,
+                color: Colors.blue,
+              ),
+            ),
+            SizedBox(height: 8),
+            Text(
+              'Cancel anytime',
+              style: TextStyle(
+                fontSize: 14,
+                color: Colors.grey,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// Updated DailyPodcastScreen with trial banner
 class DailyPodcastScreen extends StatefulWidget {
+  final bool showTrialBanner;
+  final int daysRemaining;
+
+  const DailyPodcastScreen({
+    Key? key,
+    this.showTrialBanner = false,
+    this.daysRemaining = 0,
+  }) : super(key: key);
+
   @override
   _DailyPodcastScreenState createState() => _DailyPodcastScreenState();
 }
@@ -91,6 +517,11 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     super.initState();
     _setupAudioPlayer();
     _fetchPodcasts();
+
+    // Store context for snackbars when this screen is active
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      GlobalContext.context = context;
+    });
   }
 
   void _setupAudioPlayer() {
@@ -152,7 +583,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
           // Try different possible field names for audio file
           String audioFileName = '';
           if (data['audioFilename'] != null) {
-            audioFileName = data['audioFilename']; // Note: lowercase 'n'
+            audioFileName = data['audioFilename'];
           } else if (data['audioFileName'] != null) {
             audioFileName = data['audioFileName'];
           } else if (data['audioFile'] != null) {
@@ -323,6 +754,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
       backgroundColor: Colors.grey[50],
       body: CustomScrollView(
         slivers: [
+          if (widget.showTrialBanner) _buildTrialBanner(),
           SliverAppBar(
             expandedHeight: 250.0,
             flexibleSpace: FlexibleSpaceBar(
@@ -400,6 +832,30 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildTrialBanner() {
+    return SliverToBoxAdapter(
+      child: Container(
+        width: double.infinity,
+        padding: EdgeInsets.all(12),
+        color: Colors.orange[50],
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.access_time, color: Colors.orange, size: 16),
+            SizedBox(width: 8),
+            Text(
+              '${widget.daysRemaining} days of free trial remaining',
+              style: TextStyle(
+                color: Colors.orange[800],
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
