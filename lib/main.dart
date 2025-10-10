@@ -11,8 +11,13 @@ void main() async {
   // Load environment variables
   await dotenv.load(fileName: '.env');
 
-  // Initialize Firebase
-  await Firebase.initializeApp();
+  try {
+    // Initialize Firebase
+    await Firebase.initializeApp();
+    print('Firebase initialized successfully');
+  } catch (e) {
+    print('Firebase initialization error: $e');
+  }
 
   // Initialize Supabase (for storage only)
   await Supabase.initialize(
@@ -71,7 +76,14 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
 
   // Get the public URL for a podcast file from Supabase storage
   String _getAudioUrl(String audioFileName) {
-    return '$_supabaseUrl/storage/v1/object/public/podcasts/$audioFileName';
+    String cleanFileName = audioFileName;
+    if (audioFileName.contains('/')) {
+      cleanFileName = audioFileName.split('/').last;
+    }
+    final url =
+        '$_supabaseUrl/storage/v1/object/public/podcasts/$cleanFileName';
+    print('Generated audio URL: $url');
+    return url;
   }
 
   @override
@@ -114,29 +126,70 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
 
   Future<void> _fetchPodcasts() async {
     try {
+      print('Fetching podcasts from Firestore...');
+
       final querySnapshot = await FirebaseFirestore.instance
           .collection('podcasts')
           .where('isActive', isEqualTo: true)
-          .orderBy('createdAt', descending: true)
           .get();
+
+      print('Found ${querySnapshot.docs.length} podcasts');
+
+      if (querySnapshot.docs.isEmpty) {
+        print('No active podcasts found in Firestore');
+        setState(() {
+          _podcasts = [];
+          _isLoading = false;
+        });
+        return;
+      }
 
       setState(() {
         _podcasts = querySnapshot.docs.map((doc) {
           final data = doc.data();
+          print('Raw Firestore data: $data');
+
+          // Try different possible field names for audio file
+          String audioFileName = '';
+          if (data['audioFilename'] != null) {
+            audioFileName = data['audioFilename']; // Note: lowercase 'n'
+          } else if (data['audioFileName'] != null) {
+            audioFileName = data['audioFileName'];
+          } else if (data['audioFile'] != null) {
+            audioFileName = data['audioFile'];
+          } else if (data['fileName'] != null) {
+            audioFileName = data['fileName'];
+          } else if (data['file'] != null) {
+            audioFileName = data['file'];
+          } else if (data['audio'] != null) {
+            audioFileName = data['audio'];
+          }
+
+          // Fix the file name to match what's in Supabase storage
+          if (audioFileName == 'podcast_1759978000157_ang_kakaba.mpg') {
+            audioFileName = 'podcast_1759978000157_ang_kakalba.mp3';
+          }
+
+          print('Resolved audioFileName: $audioFileName');
+
           return {
-            'title': data['title'] ?? 'Untitled',
+            'title': data['title'] ?? 'Untitled Podcast',
             'description': data['description'] ?? 'No description available.',
-            'audioFileName': data['audioFileName'] ?? '',
+            'audioFileName': audioFileName,
             'duration': data['duration'] ?? '0:00',
           };
         }).toList();
         _isLoading = false;
       });
+
+      print('Loaded ${_podcasts.length} podcasts into app');
     } catch (e) {
       print('Error fetching podcasts: $e');
       setState(() {
         _isLoading = false;
+        _podcasts = [];
       });
+
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text('Failed to load podcasts. Please try again.'),
@@ -156,6 +209,8 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
         final podcast = _todayPodcast;
         final audioFileName = podcast['audioFileName']?.toString() ?? '';
 
+        print('Attempting to play: $audioFileName');
+
         if (audioFileName.isEmpty) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
@@ -167,7 +222,19 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
         }
 
         final audioUrl = _getAudioUrl(audioFileName);
+
+        // Test if we can generate a valid URL
+        print('Audio URL: $audioUrl');
+
+        // Try to play the audio
         await _audioPlayer.play(UrlSource(audioUrl));
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Playing: ${podcast['title']}'),
+            backgroundColor: Colors.green,
+          ),
+        );
       }
     } catch (e) {
       print('Error playing audio: $e');
