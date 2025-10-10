@@ -105,13 +105,13 @@ enum AppAccessState {
 }
 
 class AppPurchaseService with ChangeNotifier {
-  final String _subscriptionProductId =
-      'podcast_subscription_monthly'; // Change to your actual product ID
+  final String _subscriptionProductId = 'podcast_subscription_monthly';
   final String _trialStartKey = 'trial_start_date';
   final String _purchasedKey = 'has_purchased';
 
   int daysRemaining = 0;
   bool _isLoading = true;
+  bool _simulateIAP = true; // Set to true to simulate IAP without Play Store
 
   // IAP related
   late StreamSubscription<List<PurchaseDetails>> _subscription;
@@ -122,11 +122,12 @@ class AppPurchaseService with ChangeNotifier {
   }
 
   Future<void> _initialize() async {
-    // Initialize trial if needed
     await _initializeTrial();
 
-    // Set up IAP listeners
-    _setupIAPListeners();
+    if (!_simulateIAP) {
+      await _setupIAPListeners();
+      await _loadProducts();
+    }
 
     _isLoading = false;
     notifyListeners();
@@ -135,14 +136,11 @@ class AppPurchaseService with ChangeNotifier {
   Future<void> _initializeTrial() async {
     final prefs = await SharedPreferences.getInstance();
 
-    // Check if trial already started
     if (!prefs.containsKey(_trialStartKey)) {
-      // First launch - start trial
       await prefs.setString(_trialStartKey, DateTime.now().toIso8601String());
       print('Trial started: ${DateTime.now()}');
     }
 
-    // Calculate days remaining
     await _calculateTrialDays();
   }
 
@@ -164,7 +162,6 @@ class AppPurchaseService with ChangeNotifier {
 
   Future<void> _setupIAPListeners() async {
     try {
-      // Check if IAP is available
       final available = await InAppPurchase.instance.isAvailable();
       if (!available) {
         print('IAP not available on this device');
@@ -175,32 +172,71 @@ class AppPurchaseService with ChangeNotifier {
       _subscription = purchaseUpdated.listen(
         _onPurchaseUpdate,
         onDone: () => _subscription.cancel(),
-        onError: (error) => print('IAP Error: $error'),
+        onError: (error) => print('IAP Stream Error: $error'),
       );
     } catch (e) {
       print('Error setting up IAP listeners: $e');
     }
   }
 
+  Future<void> _loadProducts() async {
+    try {
+      final ProductDetailsResponse response = await InAppPurchase.instance
+          .queryProductDetails({_subscriptionProductId});
+
+      if (response.notFoundIDs.isNotEmpty) {
+        print('IAP Product not found: ${response.notFoundIDs}');
+      }
+
+      _products = response.productDetails;
+      print('Loaded products: ${_products.length}');
+    } catch (e) {
+      print('Error loading products: $e');
+    }
+  }
+
   void _onPurchaseUpdate(List<PurchaseDetails> purchaseDetailsList) {
-    purchaseDetailsList.forEach(_handlePurchase);
+    for (var purchaseDetails in purchaseDetailsList) {
+      _handlePurchase(purchaseDetails);
+    }
   }
 
   Future<void> _handlePurchase(PurchaseDetails purchaseDetails) async {
     if (purchaseDetails.status == PurchaseStatus.purchased ||
         purchaseDetails.status == PurchaseStatus.restored) {
-      // Purchase successful - save purchase status
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setBool(_purchasedKey, true);
-
-      print('Purchase successful: ${purchaseDetails.productID}');
-
-      // Notify listeners to update UI
-      notifyListeners();
-
-      // IMPORTANT: Always complete the purchase
+      await _activateSubscription();
       await InAppPurchase.instance.completePurchase(purchaseDetails);
     }
+
+    if (purchaseDetails.status == PurchaseStatus.error) {
+      print('Purchase error: ${purchaseDetails.error}');
+      if (GlobalContext.context.mounted) {
+        ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+          SnackBar(
+            content: Text('Purchase failed: ${purchaseDetails.error?.message}'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _activateSubscription() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_purchasedKey, true);
+
+    print('Subscription activated successfully!');
+
+    if (GlobalContext.context.mounted) {
+      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+        SnackBar(
+          content: Text('Subscription activated successfully!'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
+
+    notifyListeners();
   }
 
   Future<AppAccessState> getAccessState() async {
@@ -229,69 +265,141 @@ class AppPurchaseService with ChangeNotifier {
   }
 
   Future<void> purchaseSubscription() async {
-    try {
-      // Load products first
-      await _loadProducts();
+    if (_simulateIAP) {
+      // Simulate IAP purchase without Play Store
+      print('SIMULATING IAP PURCHASE');
+      await _activateSubscription();
+      return;
+    }
 
+    try {
       if (_products.isEmpty) {
-        print('No products available');
-        ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
-          SnackBar(
-            content: Text(
-                'Subscription not available at the moment. Please try again later.'),
-            backgroundColor: Colors.red,
-          ),
-        );
-        return;
+        await _loadProducts();
+
+        if (_products.isEmpty) {
+          if (GlobalContext.context.mounted) {
+            ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+              SnackBar(
+                content:
+                    Text('Subscription not available. Please try again later.'),
+                backgroundColor: Colors.red,
+              ),
+            );
+          }
+          return;
+        }
       }
 
       final purchaseParam = PurchaseParam(productDetails: _products.first);
       await InAppPurchase.instance.buyConsumable(purchaseParam: purchaseParam);
     } catch (e) {
       print('Purchase error: $e');
-      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
-        SnackBar(
-          content: Text('Error processing purchase. Please try again.'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
-  }
-
-  Future<void> _loadProducts() async {
-    try {
-      final ProductDetailsResponse response = await InAppPurchase.instance
-          .queryProductDetails({_subscriptionProductId});
-
-      if (response.notFoundIDs.isNotEmpty) {
-        print('Product not found: ${response.notFoundIDs}');
+      if (GlobalContext.context.mounted) {
+        ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+          SnackBar(
+            content: Text('Error starting purchase: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
       }
-
-      _products = response.productDetails;
-      print('Loaded products: ${_products.length}');
-    } catch (e) {
-      print('Error loading products: $e');
     }
   }
 
   Future<void> restorePurchases() async {
+    if (_simulateIAP) {
+      // Simulate restore purchases
+      print('SIMULATING RESTORE PURCHASES');
+      final prefs = await SharedPreferences.getInstance();
+      final hasPurchased = prefs.getBool(_purchasedKey) ?? false;
+
+      if (hasPurchased) {
+        if (GlobalContext.context.mounted) {
+          ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+            SnackBar(
+              content: Text('Purchase restored successfully!'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        }
+      } else {
+        if (GlobalContext.context.mounted) {
+          ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+            SnackBar(
+              content: Text('No previous purchase found.'),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
+      }
+      return;
+    }
+
     try {
+      if (GlobalContext.context.mounted) {
+        ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+          SnackBar(
+            content: Text('Restoring purchases...'),
+            backgroundColor: Colors.blue,
+          ),
+        );
+      }
+
       await InAppPurchase.instance.restorePurchases();
-      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
-        SnackBar(
-          content: Text('Restoring purchases...'),
-          backgroundColor: Colors.blue,
-        ),
-      );
     } catch (e) {
       print('Restore purchases error: $e');
-      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
-        SnackBar(
-          content: Text('Error restoring purchases. Please try again.'),
-          backgroundColor: Colors.red,
-        ),
-      );
+      if (GlobalContext.context.mounted) {
+        ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+          SnackBar(
+            content: Text('Error restoring purchases: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
     }
+  }
+
+  // DEBUG METHODS
+  Future<void> debugPrintSharedPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    final keys = prefs.getKeys();
+
+    print('=== SHAREDPREFERENCES DEBUG INFO ===');
+    for (String key in keys) {
+      final value = prefs.get(key);
+      print('$key: $value (${value.runtimeType})');
+    }
+    print('====================================');
+  }
+
+  Future<void> debugSetTrialToLastDay() async {
+    final prefs = await SharedPreferences.getInstance();
+    final sixDaysAgo = DateTime.now().subtract(Duration(days: 6));
+    await prefs.setString(_trialStartKey, sixDaysAgo.toIso8601String());
+    await _calculateTrialDays();
+    await debugPrintSharedPreferences();
+    notifyListeners();
+  }
+
+  Future<void> debugSetTrialExpired() async {
+    final prefs = await SharedPreferences.getInstance();
+    final eightDaysAgo = DateTime.now().subtract(Duration(days: 8));
+    await prefs.setString(_trialStartKey, eightDaysAgo.toIso8601String());
+    await _calculateTrialDays();
+    await debugPrintSharedPreferences();
+    notifyListeners();
+  }
+
+  Future<void> debugResetTrial() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_trialStartKey, DateTime.now().toIso8601String());
+    await prefs.setBool(_purchasedKey, false);
+    await _calculateTrialDays();
+    await debugPrintSharedPreferences();
+    notifyListeners();
+  }
+
+  Future<void> debugSimulatePurchase() async {
+    await _activateSubscription();
   }
 
   @override
@@ -309,9 +417,7 @@ class GlobalContext {
 class SubscriptionScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    // Store context for snackbars
     GlobalContext.context = context;
-
     final purchaseService = Provider.of<AppPurchaseService>(context);
 
     return Scaffold(
@@ -370,7 +476,7 @@ class SubscriptionScreen extends StatelessWidget {
                     ),
                   ),
                   child: Text(
-                    'Subscribe Now',
+                    'Subscribe Now - \$4.99/month',
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                   ),
                 ),
@@ -381,6 +487,15 @@ class SubscriptionScreen extends StatelessWidget {
                 child: Text(
                   'Restore Purchase',
                   style: TextStyle(color: Colors.blue),
+                ),
+              ),
+              // Debug buttons - remove in production
+              SizedBox(height: 8),
+              TextButton(
+                onPressed: () => purchaseService.debugResetTrial(),
+                child: Text(
+                  'DEBUG: Reset Trial',
+                  style: TextStyle(color: Colors.grey, fontSize: 12),
                 ),
               ),
             ],
@@ -397,6 +512,7 @@ class SubscriptionScreen extends StatelessWidget {
       'Offline listening',
       'No advertisements',
       'Exclusive content',
+      'Cancel anytime',
     ];
 
     return Column(
@@ -407,9 +523,11 @@ class SubscriptionScreen extends StatelessWidget {
                   children: [
                     Icon(Icons.check_circle, color: Colors.green, size: 20),
                     SizedBox(width: 12),
-                    Text(
-                      feature,
-                      style: TextStyle(fontSize: 16),
+                    Expanded(
+                      child: Text(
+                        feature,
+                        style: TextStyle(fontSize: 16),
+                      ),
                     ),
                   ],
                 ),
@@ -436,7 +554,7 @@ class SubscriptionScreen extends StatelessWidget {
             ),
             SizedBox(height: 8),
             Text(
-              '\$4.99 / month', // This will be dynamic from IAP
+              '\$4.99 / month',
               style: TextStyle(
                 fontSize: 24,
                 fontWeight: FontWeight.bold,
@@ -445,7 +563,7 @@ class SubscriptionScreen extends StatelessWidget {
             ),
             SizedBox(height: 8),
             Text(
-              'Cancel anytime',
+              'Auto-renews monthly',
               style: TextStyle(
                 fontSize: 14,
                 color: Colors.grey,
@@ -458,7 +576,105 @@ class SubscriptionScreen extends StatelessWidget {
   }
 }
 
-// Updated DailyPodcastScreen with trial banner
+class SettingsScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    final purchaseService = Provider.of<AppPurchaseService>(context);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Settings'),
+      ),
+      body: ListView(
+        children: [
+          ListTile(
+            leading: Icon(Icons.workspace_premium),
+            title: Text('Subscription'),
+            subtitle: FutureBuilder<AppAccessState>(
+              future: purchaseService.getAccessState(),
+              builder: (context, snapshot) {
+                if (snapshot.hasData) {
+                  final state = snapshot.data!;
+                  return Text(state == AppAccessState.hasAccess
+                      ? 'Active Subscription'
+                      : state == AppAccessState.inTrial
+                          ? 'Free Trial Active'
+                          : 'No Active Subscription');
+                }
+                return Text('Checking status...');
+              },
+            ),
+            trailing: Icon(Icons.arrow_forward_ios),
+            onTap: () {
+              Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (context) => SubscriptionScreen()));
+            },
+          ),
+          ListTile(
+            leading: Icon(Icons.restore),
+            title: Text('Restore Purchases'),
+            onTap: () => purchaseService.restorePurchases(),
+          ),
+          ListTile(
+            leading: Icon(Icons.help),
+            title: Text('Help & Support'),
+            onTap: () {
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: Text('Help & Support'),
+                  content: Text(
+                      'For subscription issues, please contact support@yourapp.com'),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.pop(context),
+                      child: Text('OK'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+          // Debug section
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Text('DEBUG',
+                style:
+                    TextStyle(fontWeight: FontWeight.bold, color: Colors.grey)),
+          ),
+          ListTile(
+            leading: Icon(Icons.bug_report),
+            title: Text('Debug SharedPreferences'),
+            onTap: () => purchaseService.debugPrintSharedPreferences(),
+          ),
+          ListTile(
+            leading: Icon(Icons.refresh),
+            title: Text('Reset Trial to Day 1'),
+            onTap: () => purchaseService.debugResetTrial(),
+          ),
+          ListTile(
+            leading: Icon(Icons.warning),
+            title: Text('Set Trial to Last Day'),
+            onTap: () => purchaseService.debugSetTrialToLastDay(),
+          ),
+          ListTile(
+            leading: Icon(Icons.error),
+            title: Text('Set Trial Expired'),
+            onTap: () => purchaseService.debugSetTrialExpired(),
+          ),
+          ListTile(
+            leading: Icon(Icons.sim_card),
+            title: Text('Simulate Purchase'),
+            onTap: () => purchaseService.debugSimulatePurchase(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class DailyPodcastScreen extends StatefulWidget {
   final bool showTrialBanner;
   final int daysRemaining;
@@ -518,7 +734,6 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     _setupAudioPlayer();
     _fetchPodcasts();
 
-    // Store context for snackbars when this screen is active
     WidgetsBinding.instance.addPostFrameCallback((_) {
       GlobalContext.context = context;
     });
@@ -791,6 +1006,17 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
                 ),
               ),
             ),
+            actions: [
+              IconButton(
+                icon: Icon(Icons.settings),
+                onPressed: () {
+                  Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                          builder: (context) => SettingsScreen()));
+                },
+              ),
+            ],
           ),
           SliverToBoxAdapter(
             child: Padding(
