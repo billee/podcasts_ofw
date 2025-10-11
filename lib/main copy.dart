@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:in_app_purchase/in_app_purchase.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:provider/provider.dart';
 
@@ -31,7 +32,7 @@ void main() async {
 
   runApp(
     ChangeNotifierProvider(
-      create: (context) => IAPSimulationService(),
+      create: (context) => AppPurchaseService(),
       child: MyApp(),
     ),
   );
@@ -59,10 +60,10 @@ class AppAccessWrapper extends StatefulWidget {
 class _AppAccessWrapperState extends State<AppAccessWrapper> {
   @override
   Widget build(BuildContext context) {
-    final iapService = Provider.of<IAPSimulationService>(context);
+    final purchaseService = Provider.of<AppPurchaseService>(context);
 
     return FutureBuilder<AppAccessState>(
-      future: iapService.getAccessState(),
+      future: purchaseService.getAccessState(),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return Scaffold(
@@ -85,13 +86,16 @@ class _AppAccessWrapperState extends State<AppAccessWrapper> {
 
         final accessState = snapshot.data ?? AppAccessState.trialExpired;
 
+        // Print for debugging
+        print('Current access state: $accessState');
+
         switch (accessState) {
           case AppAccessState.hasAccess:
             return DailyPodcastScreen();
           case AppAccessState.inTrial:
             return DailyPodcastScreen(
               showTrialBanner: true,
-              daysRemaining: iapService.daysRemaining,
+              daysRemaining: purchaseService.daysRemaining,
             );
           case AppAccessState.trialExpired:
             return SubscriptionScreen();
@@ -109,64 +113,86 @@ enum AppAccessState {
   trialExpired, // Trial expired, needs to purchase
 }
 
-// Black Box IAP Simulation Service
-class IAPSimulationService with ChangeNotifier {
-  // Storage keys
+class AppPurchaseService with ChangeNotifier {
+  final String _subscriptionProductId = 'podcast_subscription_monthly';
   final String _trialStartKey = 'trial_start_date';
   final String _purchasedKey = 'has_purchased';
+
+  String? _userId;
   final String _userIdKey = 'user_id';
 
-  // State
   int daysRemaining = 0;
   bool _isLoading = true;
-  String? _userId;
+  bool _simulateIAP = true; // Set to true to simulate IAP without Play Store
 
-  // Firestore collection in admin project
-  final String _usersCollection = 'users';
+  // IAP related
+  late StreamSubscription<List<PurchaseDetails>> _subscription;
+  List<ProductDetails> _products = [];
 
-  IAPSimulationService() {
+  AppPurchaseService() {
     _initialize();
   }
 
-  // Initialize the black box
   Future<void> _initialize() async {
-    await _initializeUser();
     await _initializeTrial();
+    await _initializeUser();
+
+    if (!_simulateIAP) {
+      await _setupIAPListeners();
+      await _loadProducts();
+    }
+
     _isLoading = false;
     notifyListeners();
   }
 
-  // User management
   Future<void> _initializeUser() async {
     final prefs = await SharedPreferences.getInstance();
+
+    // Check if we already have a user ID
     _userId = prefs.getString(_userIdKey);
 
     if (_userId == null) {
+      // Create a new user ID
       _userId = _generateUserId();
       await prefs.setString(_userIdKey, _userId!);
-      print('🆕 New user created: $_userId');
+      print('New user created: $_userId');
 
-      // Create user document in admin project with retry
-      bool success = false;
-      int retries = 3;
-
-      while (!success && retries > 0) {
-        try {
-          await _createUserInAdminProject();
-          success = true;
-        } catch (e) {
-          retries--;
-          print(
-              '❌ Failed to create user document. Retries left: $retries. Error: $e');
-          if (retries > 0) {
-            await Future.delayed(Duration(seconds: 1));
-          }
-        }
-      }
+      // Create user document in Firestore
+      await _createUserDocument();
     } else {
-      print('👤 Existing user: $_userId');
+      print('Existing user: $_userId');
       // Update last active timestamp
       await _updateUserLastActive();
+    }
+  }
+
+  String _generateUserId() {
+    // Generate a unique user ID (you can use a package like uuid for production)
+    return 'user_${DateTime.now().millisecondsSinceEpoch}_${_randomString(6)}';
+  }
+
+  String _randomString(int length) {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    final random = Random();
+    return String.fromCharCodes(Iterable.generate(
+        length, (_) => chars.codeUnitAt(random.nextInt(chars.length))));
+  }
+
+  Future<void> _createUserDocument() async {
+    try {
+      await FirebaseFirestore.instance.collection('users').doc(_userId).set({
+        'userId': _userId,
+        'createdAt': FieldValue.serverTimestamp(),
+        'trialStartDate': FieldValue.serverTimestamp(),
+        'isSubscribed': false,
+        'lastActive': FieldValue.serverTimestamp(),
+        'appVersion': '1.0.0',
+        'platform': 'android', // or get from device info
+      });
+      print('User document created in Firestore');
+    } catch (e) {
+      print('Error creating user document: $e');
     }
   }
 
@@ -174,122 +200,14 @@ class IAPSimulationService with ChangeNotifier {
     if (_userId == null) return;
 
     try {
-      await FirebaseFirestore.instance
-          .collection(_usersCollection)
-          .doc(_userId)
-          .set({
+      await FirebaseFirestore.instance.collection('users').doc(_userId).update({
         'lastActive': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-      print('✅ User last active updated: $_userId');
-    } catch (e) {
-      print('❌ Error updating user last active: $e');
-      // If updating fails, try to create the user document
-      await _createUserInAdminProject();
-    }
-  }
-
-  String _generateUserId() {
-    final random = Random();
-    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-    return 'user_${DateTime.now().millisecondsSinceEpoch}_${String.fromCharCodes(Iterable.generate(6, (_) => chars.codeUnitAt(random.nextInt(chars.length))))}';
-  }
-
-  // Store user data in admin project Firestore
-  Future<void> _createUserInAdminProject() async {
-    try {
-      final userData = {
-        'userId': _userId,
-        'createdAt': FieldValue.serverTimestamp(),
-        'trialStartDate': FieldValue.serverTimestamp(),
-        'isSubscribed': false,
-        'lastActive': FieldValue.serverTimestamp(),
-        'appVersion': '1.0.0',
-        'platform': 'mobile',
-        'status': 'active',
-        'createdVia': 'mobile_app',
-      };
-
-      print('🔄 Creating user in admin database: $_userId');
-
-      await FirebaseFirestore.instance
-          .collection(_usersCollection)
-          .doc(_userId)
-          .set(userData);
-
-      print('✅ SUCCESS: User document created in admin project');
-      print('📊 User ID: $_userId');
-      print('💾 Collection: $_usersCollection');
-    } catch (e) {
-      print('❌ ERROR creating user document in admin project: $e');
-
-      if (e is FirebaseException) {
-        print('❌ Firebase error code: ${e.code}');
-        print('❌ Firebase error message: ${e.message}');
-      }
-
-      // Try one more time with a simple document
-      try {
-        print('🔄 Retrying with simple document...');
-        await FirebaseFirestore.instance
-            .collection(_usersCollection)
-            .doc(_userId)
-            .set({
-          'userId': _userId,
-          'createdAt': FieldValue.serverTimestamp(),
-          'status': 'active',
-        });
-        print('✅ SUCCESS: Simple user document created');
-      } catch (retryError) {
-        print(
-            '❌ FAILED: Could not create user document even with retry: $retryError');
-      }
-    }
-  }
-
-  Future<void> debugCheckFirebaseConnection() async {
-    print('🔍 Checking Firebase connection...');
-
-    try {
-      // Test write
-      final testDocRef =
-          FirebaseFirestore.instance.collection('connection_test').doc('test');
-      await testDocRef.set({
-        'testTime': FieldValue.serverTimestamp(),
-        'message': 'Firebase connection test',
       });
-
-      // Test read
-      final testDoc = await testDocRef.get();
-
-      if (testDoc.exists) {
-        print('✅ Firebase connection: SUCCESS');
-        print('✅ Can read/write to Firestore');
-
-        // Clean up test document
-        await testDocRef.delete();
-      } else {
-        print('❌ Firebase connection: Could not read test document');
-      }
-
-      // Check if users collection is accessible
-      final usersQuery = await FirebaseFirestore.instance
-          .collection(_usersCollection)
-          .limit(1)
-          .get();
-
-      print('✅ Users collection is accessible');
-      print('📊 Total users in database: ${usersQuery.size}');
     } catch (e) {
-      print('❌ Firebase connection: FAILED - $e');
-
-      if (e is FirebaseException) {
-        print('❌ Firebase error code: ${e.code}');
-        print('❌ Firebase error message: ${e.message}');
-      }
+      print('Error updating user last active: $e');
     }
   }
 
-  // Trial management
   Future<void> _initializeTrial() async {
     final prefs = await SharedPreferences.getInstance();
 
@@ -310,155 +228,81 @@ class IAPSimulationService with ChangeNotifier {
       final trialEnd = trialStart.add(Duration(days: 7));
       final now = DateTime.now();
 
-      daysRemaining = trialEnd.difference(now).inDays;
+      // Calculate the difference in days
+      final difference = trialEnd.difference(now);
+      daysRemaining = difference.inDays;
+
+      // If we're on the same day but trial hasn't ended, show 1 day remaining
+      if (difference.inHours > 0 && difference.inDays == 0) {
+        daysRemaining = 1; // Show 1 day remaining on the last day
+      }
+
       if (daysRemaining < 0) daysRemaining = 0;
 
-      print('Trial days remaining: $daysRemaining');
+      print('Trial calculation:');
+      print('- Trial start: $trialStart');
+      print('- Trial end: $trialEnd');
+      print('- Now: $now');
+      print(
+          '- Difference: ${difference.inDays} days, ${difference.inHours.remainder(24)} hours');
+      print('- Days remaining: $daysRemaining');
     }
   }
 
-  // Black Box IAP Simulation
-  Future<void> simulatePurchase() async {
-    print('🚀 IAP BLACK BOX: Starting purchase simulation...');
-
-    // Step 1: Show processing UI
-    if (GlobalContext.context.mounted) {
-      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
-        SnackBar(
-          content: Text('Processing purchase...'),
-          backgroundColor: Colors.blue,
-        ),
-      );
-    }
-
-    // Step 2: Simulate network delay
-    await Future.delayed(Duration(seconds: 2));
-
-    // Step 3: Process payment (simulated)
-    print('💳 IAP BLACK BOX: Processing payment...');
-    await Future.delayed(Duration(seconds: 1));
-
-    // Step 4: Verify payment (simulated - always successful)
-    print('✅ IAP BLACK BOX: Payment verified successfully');
-
-    // Step 5: Activate subscription
-    await _activateSubscription();
-
-    // Step 6: Show success
-    if (GlobalContext.context.mounted) {
-      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
-        SnackBar(
-          content: Text('🎉 Subscription activated successfully!'),
-          backgroundColor: Colors.green,
-        ),
-      );
-    }
-
-    print('🏁 IAP BLACK BOX: Purchase simulation completed');
-  }
-
-  Future<void> _activateSubscription() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool(_purchasedKey, true);
-
-    // Update admin project
-    await _updateSubscriptionStatus(true);
-
-    print('Subscription activated for user: $_userId');
-    notifyListeners();
-  }
-
-  Future<void> _updateSubscriptionStatus(bool isSubscribed) async {
-    if (_userId == null) {
-      print('❌ Cannot update subscription: user ID is null');
-      return;
-    }
-
+  Future<void> _setupIAPListeners() async {
     try {
-      final updateData = {
-        'isSubscribed': isSubscribed,
-        'subscriptionActivatedAt':
-            isSubscribed ? FieldValue.serverTimestamp() : null,
-        'lastActive': FieldValue.serverTimestamp(),
-        'subscriptionStatus': isSubscribed ? 'active' : 'inactive',
-      };
-
-      // Use set with merge: true to create the document if it doesn't exist
-      await FirebaseFirestore.instance
-          .collection(_usersCollection)
-          .doc(_userId)
-          .set(updateData, SetOptions(merge: true));
-
-      print('✅ Subscription status updated in admin project: $isSubscribed');
-      print('✅ Update data: $updateData');
-    } catch (e) {
-      print('❌ Error updating subscription status: $e');
-      if (e is FirebaseException) {
-        print('❌ Firebase error code: ${e.code}');
-        print('❌ Firebase error message: ${e.message}');
+      final available = await InAppPurchase.instance.isAvailable();
+      if (!available) {
+        print('IAP not available on this device');
+        return;
       }
 
-      // Try to create the user document if it doesn't exist
-      await _createUserInAdminProject();
-      // Then try updating again
-      await _updateSubscriptionStatus(isSubscribed);
+      final purchaseUpdated = InAppPurchase.instance.purchaseStream;
+      _subscription = purchaseUpdated.listen(
+        _onPurchaseUpdate,
+        onDone: () => _subscription.cancel(),
+        onError: (error) => print('IAP Stream Error: $error'),
+      );
+    } catch (e) {
+      print('Error setting up IAP listeners: $e');
     }
   }
 
-  // Restore purchases simulation
-  Future<void> simulateRestorePurchases() async {
-    print('🔄 IAP BLACK BOX: Starting restore simulation...');
+  Future<void> _loadProducts() async {
+    try {
+      final ProductDetailsResponse response = await InAppPurchase.instance
+          .queryProductDetails({_subscriptionProductId});
 
-    if (GlobalContext.context.mounted) {
-      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
-        SnackBar(
-          content: Text('Checking for previous purchases...'),
-          backgroundColor: Colors.blue,
-        ),
-      );
+      if (response.notFoundIDs.isNotEmpty) {
+        print('IAP Product not found: ${response.notFoundIDs}');
+      }
+
+      _products = response.productDetails;
+      print('Loaded products: ${_products.length}');
+    } catch (e) {
+      print('Error loading products: $e');
+    }
+  }
+
+  void _onPurchaseUpdate(List<PurchaseDetails> purchaseDetailsList) {
+    for (var purchaseDetails in purchaseDetailsList) {
+      _handlePurchase(purchaseDetails);
+    }
+  }
+
+  Future<void> _handlePurchase(PurchaseDetails purchaseDetails) async {
+    if (purchaseDetails.status == PurchaseStatus.purchased ||
+        purchaseDetails.status == PurchaseStatus.restored) {
+      await _activateSubscription();
+      await InAppPurchase.instance.completePurchase(purchaseDetails);
     }
 
-    // Simulate network delay
-    await Future.delayed(Duration(seconds: 2));
-
-    try {
-      if (_userId != null) {
-        final userDoc = await FirebaseFirestore.instance
-            .collection(_usersCollection)
-            .doc(_userId)
-            .get();
-
-        if (userDoc.exists && userDoc.data()!['isSubscribed'] == true) {
-          // User has active subscription in admin project
-          final prefs = await SharedPreferences.getInstance();
-          await prefs.setBool(_purchasedKey, true);
-
-          if (GlobalContext.context.mounted) {
-            ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
-              SnackBar(
-                content: Text('✅ Purchase restored successfully!'),
-                backgroundColor: Colors.green,
-              ),
-            );
-          }
-          notifyListeners();
-        } else {
-          if (GlobalContext.context.mounted) {
-            ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
-              SnackBar(
-                content: Text('No previous purchase found.'),
-                backgroundColor: Colors.orange,
-              ),
-            );
-          }
-        }
-      }
-    } catch (e) {
-      print('Error restoring purchases: $e');
+    if (purchaseDetails.status == PurchaseStatus.error) {
+      print('Purchase error: ${purchaseDetails.error}');
       if (GlobalContext.context.mounted) {
         ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
           SnackBar(
-            content: Text('Error restoring purchases. Please try again.'),
+            content: Text('Purchase failed: ${purchaseDetails.error?.message}'),
             backgroundColor: Colors.red,
           ),
         );
@@ -466,34 +310,87 @@ class IAPSimulationService with ChangeNotifier {
     }
   }
 
-  // Access state check
+  Future<void> _activateSubscription() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_purchasedKey, true);
+
+    // Update Firestore with subscription info
+    await _updateSubscriptionStatus(true);
+
+    print('Subscription activated successfully for user: $_userId');
+
+    if (GlobalContext.context.mounted) {
+      ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+        SnackBar(
+          content: Text('Subscription activated successfully!'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    }
+
+    notifyListeners();
+  }
+
+  Future<void> _updateSubscriptionStatus(bool isSubscribed) async {
+    if (_userId == null) return;
+
+    try {
+      await FirebaseFirestore.instance.collection('users').doc(_userId).update({
+        'isSubscribed': isSubscribed,
+        'subscriptionActivatedAt':
+            isSubscribed ? FieldValue.serverTimestamp() : null,
+        'lastActive': FieldValue.serverTimestamp(),
+      });
+      print('Subscription status updated in Firestore: $isSubscribed');
+    } catch (e) {
+      print('Error updating subscription status: $e');
+    }
+  }
+
   Future<AppAccessState> getAccessState() async {
     final prefs = await SharedPreferences.getInstance();
 
-    // Check local subscription status first
+    // First check local storage for quick access
     final hasPurchased = prefs.getBool(_purchasedKey) ?? false;
     if (hasPurchased) {
       return AppAccessState.hasAccess;
     }
 
-    // Fallback: Check admin project for subscription status
+    // For more reliability, we can check Firestore
     try {
       if (_userId != null) {
         final userDoc = await FirebaseFirestore.instance
-            .collection(_usersCollection)
+            .collection('users')
             .doc(_userId)
             .get();
 
-        if (userDoc.exists && userDoc.data()!['isSubscribed'] == true) {
-          await prefs.setBool(_purchasedKey, true);
-          return AppAccessState.hasAccess;
+        if (userDoc.exists) {
+          final userData = userDoc.data()!;
+
+          // Check subscription status from Firestore
+          if (userData['isSubscribed'] == true) {
+            // Update local storage to match
+            await prefs.setBool(_purchasedKey, true);
+            return AppAccessState.hasAccess;
+          }
+
+          // Check trial status from Firestore
+          final trialStart = (userData['trialStartDate'] as Timestamp).toDate();
+          final trialEnd = trialStart.add(Duration(days: 7));
+          final now = DateTime.now();
+
+          if (now.isBefore(trialEnd)) {
+            await _calculateTrialDays();
+            return AppAccessState.inTrial;
+          }
         }
       }
     } catch (e) {
-      print('Error checking admin project: $e');
+      print('Error checking access from Firestore: $e');
+      // Fall back to local storage if Firestore fails
     }
 
-    // Check trial status
+    // Fallback to local storage check
     final trialStartString = prefs.getString(_trialStartKey);
     if (trialStartString != null) {
       final trialStart = DateTime.parse(trialStartString);
@@ -509,58 +406,132 @@ class IAPSimulationService with ChangeNotifier {
     return AppAccessState.trialExpired;
   }
 
-  // Debug methods
-  Future<void> debugPrintState() async {
+  Future<void> purchaseSubscription() async {
+    if (_simulateIAP) {
+      // Simulate IAP purchase without Play Store
+      print('SIMULATING IAP PURCHASE');
+      await _activateSubscription();
+      return;
+    }
+
+    try {
+      if (_products.isEmpty) {
+        await _loadProducts();
+
+        if (_products.isEmpty) {
+          if (GlobalContext.context.mounted) {
+            ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+              SnackBar(
+                content:
+                    Text('Subscription not available. Please try again later.'),
+                backgroundColor: Colors.red,
+              ),
+            );
+          }
+          return;
+        }
+      }
+
+      final purchaseParam = PurchaseParam(productDetails: _products.first);
+      await InAppPurchase.instance.buyConsumable(purchaseParam: purchaseParam);
+    } catch (e) {
+      print('Purchase error: $e');
+      if (GlobalContext.context.mounted) {
+        ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+          SnackBar(
+            content: Text('Error starting purchase: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> restorePurchases() async {
+    if (_simulateIAP) {
+      // Simulate restore purchases
+      print('SIMULATING RESTORE PURCHASES');
+      final prefs = await SharedPreferences.getInstance();
+      final hasPurchased = prefs.getBool(_purchasedKey) ?? false;
+
+      if (hasPurchased) {
+        if (GlobalContext.context.mounted) {
+          ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+            SnackBar(
+              content: Text('Purchase restored successfully!'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        }
+      } else {
+        if (GlobalContext.context.mounted) {
+          ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+            SnackBar(
+              content: Text('No previous purchase found.'),
+              backgroundColor: Colors.orange,
+            ),
+          );
+        }
+      }
+      return;
+    }
+
+    try {
+      if (GlobalContext.context.mounted) {
+        ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+          SnackBar(
+            content: Text('Restoring purchases...'),
+            backgroundColor: Colors.blue,
+          ),
+        );
+      }
+
+      await InAppPurchase.instance.restorePurchases();
+    } catch (e) {
+      print('Restore purchases error: $e');
+      if (GlobalContext.context.mounted) {
+        ScaffoldMessenger.of(GlobalContext.context).showSnackBar(
+          SnackBar(
+            content: Text('Error restoring purchases: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  // DEBUG METHODS
+  Future<void> debugPrintSharedPreferences() async {
     final prefs = await SharedPreferences.getInstance();
     final keys = prefs.getKeys();
 
-    print('=== IAP BLACK BOX DEBUG STATE ===');
-    print('👤 User ID: $_userId');
-    print('📅 Days Remaining: $daysRemaining');
-    print('📱 SharedPreferences Keys:');
-
+    print('=== SHAREDPREFERENCES DEBUG INFO ===');
     for (String key in keys) {
       final value = prefs.get(key);
-      print('   - $key: $value');
+      print('$key: $value (${value.runtimeType})');
     }
-
-    // Check if user exists in admin database
-    if (_userId != null) {
-      try {
-        final userDoc = await FirebaseFirestore.instance
-            .collection(_usersCollection)
-            .doc(_userId)
-            .get();
-
-        if (userDoc.exists) {
-          print('✅ User exists in admin database');
-          print('📊 User data: ${userDoc.data()}');
-        } else {
-          print('❌ User NOT FOUND in admin database');
-        }
-      } catch (e) {
-        print('❌ Error checking admin database: $e');
-      }
-    }
-
-    print('===================================');
+    print('====================================');
   }
 
   Future<void> debugSetTrialToLastDay() async {
     final prefs = await SharedPreferences.getInstance();
 
     // Set trial start to 6 days ago (so today is the 7th/last day)
+    // This should give 1 day remaining, not 0
     final sixDaysAgo = DateTime.now().subtract(Duration(days: 6));
     await prefs.setString(_trialStartKey, sixDaysAgo.toIso8601String());
-    await prefs.setBool(_purchasedKey, false);
+    await prefs.setBool(_purchasedKey, false); // Ensure not purchased
 
+    // Force recalculate days
     await _calculateTrialDays();
 
-    print('🔄 DEBUG: Trial set to LAST DAY (should show 1 day remaining)');
-    print('📅 DEBUG: Trial start set to: $sixDaysAgo');
-    await debugPrintState();
+    print('DEBUG: Trial set to LAST DAY (should show 1 day remaining)');
+    print('DEBUG: Actual days remaining: $daysRemaining');
+    await debugPrintSharedPreferences();
 
     notifyListeners();
+
+    // Force navigation
     _forceAppRefresh();
   }
 
@@ -570,104 +541,66 @@ class IAPSimulationService with ChangeNotifier {
     // Set trial start to 8 days ago (trial expired)
     final eightDaysAgo = DateTime.now().subtract(Duration(days: 8));
     await prefs.setString(_trialStartKey, eightDaysAgo.toIso8601String());
-    await prefs.setBool(_purchasedKey, false);
+    await prefs.setBool(_purchasedKey, false); // Ensure not purchased
 
     await _calculateTrialDays();
 
-    print('🔄 DEBUG: Trial set to EXPIRED');
-    print('📅 DEBUG: Trial start set to: $eightDaysAgo');
-    await debugPrintState();
+    print('DEBUG: Trial set to EXPIRED');
+    await debugPrintSharedPreferences();
 
     notifyListeners();
+
+    // Force navigation
     _forceAppRefresh();
   }
 
   Future<void> debugResetTrial() async {
-    print('🔄 DEBUG: Resetting trial to Day 1 - Clearing all data');
-
-    // Clear ALL SharedPreferences
     final prefs = await SharedPreferences.getInstance();
-    await prefs.clear();
 
-    print('✅ DEBUG: SharedPreferences completely cleared');
+    // Set trial to today (fresh start)
+    await prefs.setString(_trialStartKey, DateTime.now().toIso8601String());
+    await prefs.setBool(_purchasedKey, false); // Ensure not purchased
 
-    // Reset all state variables
-    _userId = null;
-    daysRemaining = 0;
-    _isLoading = true;
+    await _calculateTrialDays();
 
-    // Force reinitialization to create new user
-    await _initialize();
-
-    print(
-        '✅ DEBUG: Trial reset complete - New user should be created in admin database');
-    await debugPrintState();
+    print('DEBUG: Trial reset to DAY 1 (7 days remaining)');
+    await debugPrintSharedPreferences();
 
     notifyListeners();
+
+    // Force navigation
     _forceAppRefresh();
   }
 
-  // Future<void> debugCheckFirebaseConnection() async {
-  //   print('🔍 Checking Firebase connection...');
-
-  //   try {
-  //     // Test write
-  //     final testDocRef =
-  //         FirebaseFirestore.instance.collection('connection_test').doc('test');
-  //     await testDocRef.set({
-  //       'testTime': FieldValue.serverTimestamp(),
-  //       'message': 'Firebase connection test',
-  //     });
-
-  //     // Test read
-  //     final testDoc = await testDocRef.get();
-
-  //     if (testDoc.exists) {
-  //       print('✅ Firebase connection: SUCCESS');
-  //       print('✅ Can read/write to Firestore');
-
-  //       // Clean up test document
-  //       await testDocRef.delete();
-  //     } else {
-  //       print('❌ Firebase connection: Could not read test document');
-  //     }
-
-  //     // Check if users collection is accessible
-  //     final usersQuery = await FirebaseFirestore.instance
-  //         .collection(_usersCollection)
-  //         .limit(1)
-  //         .get();
-
-  //     print('✅ Users collection is accessible');
-  //     print('📊 Total users in database: ${usersQuery.size}');
-  //   } catch (e) {
-  //     print('❌ Firebase connection: FAILED - $e');
-
-  //     if (e is FirebaseException) {
-  //       print('❌ Firebase error code: ${e.code}');
-  //       print('❌ Firebase error message: ${e.message}');
-  //     }
-  //   }
-  // }
+  Future<void> debugSimulatePurchase() async {
+    await _activateSubscription();
+  }
 
   void _forceAppRefresh() {
+    // This will trigger the AppAccessWrapper to rebuild
+    // We use a small delay to ensure the state is updated first
     Future.delayed(Duration(milliseconds: 100), () {
       notifyListeners();
     });
   }
+
+  @override
+  void dispose() {
+    _subscription.cancel();
+    super.dispose();
+  }
 }
 
-// Helper for global context
+// Helper class to get context for snackbars
 class GlobalContext {
   static late BuildContext context;
 }
 
-// Subscription Screen with Black Box IAP
 class SubscriptionScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     GlobalContext.context = context;
-    final iapService = Provider.of<IAPSimulationService>(context);
+    final purchaseService = Provider.of<AppPurchaseService>(context);
 
     return Scaffold(
       backgroundColor: Colors.grey[50],
@@ -676,16 +609,31 @@ class SubscriptionScreen extends StatelessWidget {
           padding: const EdgeInsets.all(24.0),
           child: Column(
             children: [
-              // Header
-              Icon(Icons.workspace_premium, size: 80, color: Colors.blue),
+              // Header section
+              Icon(
+                Icons.workspace_premium,
+                size: 80,
+                color: Colors.blue,
+              ),
               SizedBox(height: 16),
-              Text('Unlock Full Access',
-                  style: TextStyle(fontSize: 28, fontWeight: FontWeight.bold)),
+              Text(
+                'Unlock Full Access',
+                style: TextStyle(
+                  fontSize: 28,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.black87,
+                ),
+              ),
               SizedBox(height: 12),
               Text(
-                  'Your 7-day free trial has ended. Subscribe to continue enjoying daily podcasts.',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(fontSize: 16, height: 1.5)),
+                'Your 7-day free trial has ended. Subscribe now to continue enjoying daily podcasts.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 16,
+                  height: 1.5,
+                  color: Colors.black87,
+                ),
+              ),
               SizedBox(height: 24),
 
               // Scrollable content
@@ -701,41 +649,48 @@ class SubscriptionScreen extends StatelessWidget {
                 ),
               ),
 
-              // Fixed buttons
+              // Fixed buttons at bottom
               Container(
                 width: double.infinity,
                 child: ElevatedButton(
-                  onPressed: () => iapService.simulatePurchase(),
+                  onPressed: () => purchaseService.purchaseSubscription(),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: Colors.blue,
                     foregroundColor: Colors.white,
                     padding: EdgeInsets.symmetric(vertical: 16),
                     shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12)),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                   ),
-                  child: Text('Subscribe Now - \$4.99/month',
-                      style:
-                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  child: Text(
+                    'Subscribe Now - \$4.99/month',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
                 ),
               ),
               SizedBox(height: 12),
               TextButton(
-                onPressed: () => iapService.simulateRestorePurchases(),
-                child: Text('Restore Purchase',
-                    style: TextStyle(color: Colors.blue)),
+                onPressed: () => purchaseService.restorePurchases(),
+                child: Text(
+                  'Restore Purchase',
+                  style: TextStyle(color: Colors.blue),
+                ),
               ),
               // Debug button
               TextButton(
                 onPressed: () {
-                  iapService.debugResetTrial();
+                  purchaseService.debugResetTrial();
+                  // Force rebuild by using a hack - navigate away and back
                   Navigator.pushAndRemoveUntil(
                     context,
                     MaterialPageRoute(builder: (context) => MyApp()),
                     (route) => false,
                   );
                 },
-                child: Text('DEBUG: Reset Trial',
-                    style: TextStyle(color: Colors.grey, fontSize: 12)),
+                child: Text(
+                  'DEBUG: Reset Trial',
+                  style: TextStyle(color: Colors.grey, fontSize: 12),
+                ),
               ),
             ],
           ),
@@ -763,7 +718,11 @@ class SubscriptionScreen extends StatelessWidget {
                     Icon(Icons.check_circle, color: Colors.green, size: 20),
                     SizedBox(width: 12),
                     Expanded(
-                        child: Text(feature, style: TextStyle(fontSize: 16))),
+                      child: Text(
+                        feature,
+                        style: TextStyle(fontSize: 16),
+                      ),
+                    ),
                   ],
                 ),
               ))
@@ -779,17 +738,31 @@ class SubscriptionScreen extends StatelessWidget {
         padding: const EdgeInsets.all(16.0),
         child: Column(
           children: [
-            Text('Monthly Subscription',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(
+              'Monthly Subscription',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: Colors.black87,
+              ),
+            ),
             SizedBox(height: 8),
-            Text('\$4.99 / month',
-                style: TextStyle(
-                    fontSize: 24,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.blue)),
+            Text(
+              '\$4.99 / month',
+              style: TextStyle(
+                fontSize: 24,
+                fontWeight: FontWeight.bold,
+                color: Colors.blue,
+              ),
+            ),
             SizedBox(height: 8),
-            Text('Auto-renews monthly',
-                style: TextStyle(fontSize: 14, color: Colors.grey)),
+            Text(
+              'Auto-renews monthly',
+              style: TextStyle(
+                fontSize: 14,
+                color: Colors.grey,
+              ),
+            ),
           ],
         ),
       ),
@@ -797,21 +770,22 @@ class SubscriptionScreen extends StatelessWidget {
   }
 }
 
-// Settings Screen
 class SettingsScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    final iapService = Provider.of<IAPSimulationService>(context);
+    final purchaseService = Provider.of<AppPurchaseService>(context);
 
     return Scaffold(
-      appBar: AppBar(title: Text('Settings')),
+      appBar: AppBar(
+        title: Text('Settings'),
+      ),
       body: ListView(
         children: [
           ListTile(
             leading: Icon(Icons.workspace_premium),
             title: Text('Subscription'),
             subtitle: FutureBuilder<AppAccessState>(
-              future: iapService.getAccessState(),
+              future: purchaseService.getAccessState(),
               builder: (context, snapshot) {
                 if (snapshot.hasData) {
                   final state = snapshot.data!;
@@ -825,35 +799,37 @@ class SettingsScreen extends StatelessWidget {
               },
             ),
             trailing: Icon(Icons.arrow_forward_ios),
-            onTap: () => Navigator.push(context,
-                MaterialPageRoute(builder: (context) => SubscriptionScreen())),
+            onTap: () {
+              Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                      builder: (context) => SubscriptionScreen()));
+            },
           ),
           ListTile(
             leading: Icon(Icons.restore),
             title: Text('Restore Purchases'),
-            onTap: () => iapService.simulateRestorePurchases(),
-          ),
-          ListTile(
-            leading: Icon(Icons.cloud),
-            title: Text('Check Firebase Connection'),
-            onTap: () => iapService.debugCheckFirebaseConnection(),
+            onTap: () => purchaseService.restorePurchases(),
           ),
           ListTile(
             leading: Icon(Icons.help),
             title: Text('Help & Support'),
-            onTap: () => showDialog(
-              context: context,
-              builder: (context) => AlertDialog(
-                title: Text('Help & Support'),
-                content: Text(
-                    'For subscription issues, please contact support@yourapp.com'),
-                actions: [
-                  TextButton(
+            onTap: () {
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: Text('Help & Support'),
+                  content: Text(
+                      'For subscription issues, please contact support@yourapp.com'),
+                  actions: [
+                    TextButton(
                       onPressed: () => Navigator.pop(context),
-                      child: Text('OK'))
-                ],
-              ),
-            ),
+                      child: Text('OK'),
+                    ),
+                  ],
+                ),
+              );
+            },
           ),
           // Debug section
           Padding(
@@ -864,41 +840,52 @@ class SettingsScreen extends StatelessWidget {
           ),
           ListTile(
             leading: Icon(Icons.bug_report),
-            title: Text('Debug State'),
-            onTap: () => iapService.debugPrintState(),
+            title: Text('Debug SharedPreferences'),
+            onTap: () => purchaseService.debugPrintSharedPreferences(),
           ),
           ListTile(
             leading: Icon(Icons.refresh),
             title: Text('Reset Trial to Day 1'),
             onTap: () async {
-              await iapService.debugResetTrial();
+              await purchaseService.debugResetTrial();
+              // Force navigation back
               Navigator.pushAndRemoveUntil(
-                  context,
-                  MaterialPageRoute(builder: (context) => MyApp()),
-                  (route) => false);
+                context,
+                MaterialPageRoute(builder: (context) => MyApp()),
+                (route) => false,
+              );
             },
           ),
           ListTile(
             leading: Icon(Icons.warning),
             title: Text('Set Trial to Last Day'),
             onTap: () async {
-              await iapService.debugSetTrialToLastDay();
+              await purchaseService.debugSetTrialToLastDay();
+              // Force navigation back
               Navigator.pushAndRemoveUntil(
-                  context,
-                  MaterialPageRoute(builder: (context) => MyApp()),
-                  (route) => false);
+                context,
+                MaterialPageRoute(builder: (context) => MyApp()),
+                (route) => false,
+              );
             },
           ),
           ListTile(
             leading: Icon(Icons.error),
             title: Text('Set Trial Expired'),
             onTap: () async {
-              await iapService.debugSetTrialExpired();
+              await purchaseService.debugSetTrialExpired();
+              // Force navigation back
               Navigator.pushAndRemoveUntil(
-                  context,
-                  MaterialPageRoute(builder: (context) => MyApp()),
-                  (route) => false);
+                context,
+                MaterialPageRoute(builder: (context) => MyApp()),
+                (route) => false,
+              );
             },
+          ),
+          ListTile(
+            leading: Icon(Icons.sim_card),
+            title: Text('Simulate Purchase'),
+            onTap: () => purchaseService.debugSimulatePurchase(),
           ),
         ],
       ),
@@ -906,7 +893,6 @@ class SettingsScreen extends StatelessWidget {
   }
 }
 
-// DailyPodcastScreen (keep your existing implementation, just update the provider type)
 class DailyPodcastScreen extends StatefulWidget {
   final bool showTrialBanner;
   final int daysRemaining;
@@ -973,7 +959,8 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
 
   void _setupAudioPlayer() {
     _audioPlayer.onPlayerStateChanged.listen((state) {
-      if (mounted && !_isSeeking) {
+      if (!mounted) return; // Prevent setState if widget is disposed
+      if (!_isSeeking) {
         setState(() {
           _playerState = state;
         });
@@ -981,15 +968,15 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     });
 
     _audioPlayer.onDurationChanged.listen((duration) {
-      if (mounted) {
-        setState(() {
-          _duration = duration;
-        });
-      }
+      if (!mounted) return; // Prevent setState if widget is disposed
+      setState(() {
+        _duration = duration;
+      });
     });
 
     _audioPlayer.onPositionChanged.listen((position) {
-      if (mounted && !_isSeeking) {
+      if (!mounted) return; // Prevent setState if widget is disposed
+      if (!_isSeeking) {
         setState(() {
           _position = position;
         });
@@ -997,12 +984,11 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
     });
 
     _audioPlayer.onPlayerComplete.listen((event) {
-      if (mounted) {
-        setState(() {
-          _playerState = PlayerState.stopped;
-          _position = Duration.zero;
-        });
-      }
+      if (!mounted) return; // Prevent setState if widget is disposed
+      setState(() {
+        _playerState = PlayerState.stopped;
+        _position = Duration.zero;
+      });
     });
   }
 
@@ -1175,6 +1161,7 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
   @override
   void dispose() {
     _audioPlayer.dispose();
+    // Also cancel any other subscriptions if you have them
     super.dispose();
   }
 
@@ -1294,6 +1281,14 @@ class _DailyPodcastScreenState extends State<DailyPodcastScreen> {
             ),
           ),
         ],
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () {
+          Navigator.push(context,
+              MaterialPageRoute(builder: (context) => SettingsScreen()));
+        },
+        child: Icon(Icons.settings),
+        backgroundColor: Colors.blue,
       ),
     );
   }
